@@ -1,0 +1,9 @@
+.env
+.execution-token
+testpilot.db
+artifacts/
+__pycache__/
+.pytest_cache/
+work/
+outputs/
+.playwright-mcp/

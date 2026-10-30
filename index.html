@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101a24"><title>TestPilot AI · QA workspace</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="#dashboard"><span class="brand-mark">T</span><span>TestPilot<span class="brand-ai"> AI</span><small>QUALITY WORKSPACE</small></span></a>
+    <div class="side-label">WORKSPACE</div>
+    <nav id="nav">
+      <a href="#dashboard" data-page="dashboard"><i>◫</i>Dashboard</a>
+      <a href="#projects" data-page="projects"><i>▤</i>Projects</a>
+      <a href="#requirements" data-page="requirements"><i>≡</i>Requirements</a>
+      <a href="#test-cases" data-page="test-cases"><i>☷</i>Test Cases</a>
+      <a href="#scripts" data-page="scripts"><i>⌘</i>Automation Scripts</a>
+      <a href="#suites" data-page="suites"><i>▣</i>Test Suites</a>
+      <a href="#scanner" data-page="scanner"><i>◎</i>Website Scanner</a>
+      <a href="#runs" data-page="runs"><i>▷</i>Test Runs</a>
+      <a href="#bugs" data-page="bugs"><i>⚑</i>Bugs</a>
+      <a href="#reports" data-page="reports"><i>▥</i>Reports</a>
+    </nav>
+    <div class="sidebar-bottom"><a href="#settings" data-page="settings"><i>⚙</i>Settings</a><div class="user-chip"><span class="avatar">QA</span><span>QA Workspace<small>Local project</small></span><span class="online"></span></div></div>
+  </aside>
+  <main class="main"><header class="topbar"><div class="crumb"><span>Workspace</span><b>/</b><strong id="top-title">Dashboard</strong></div><div class="top-actions"><span class="connection" id="connection"><i></i>Checking services</span><button class="icon-btn" title="Refresh" onclick="app.refresh()">↻</button><button class="btn secondary small" id="logout" hidden>Log out</button><span class="avatar small-avatar">QA</span></div></header><section id="content" class="content"></section></main>
+</div>
+<div id="auth-gate" class="auth-gate" hidden><form id="auth-form" class="auth-card"><span class="brand-mark">T</span><p class="eyebrow">TESTPILOT AI</p><h1>Sign in to your QA workspace</h1><p>Enter the workspace password to continue.</p><div class="field"><label for="login-password">Workspace password</label><input id="login-password" type="password" autocomplete="current-password" required></div><div id="login-error" class="login-error" role="alert"></div><button class="btn primary" type="submit">Sign in</button></form></div>
+<dialog id="modal"><form method="dialog" id="modal-form"><div class="modal-head"><div><p class="eyebrow" id="modal-kicker">WORKSPACE</p><h2 id="modal-title">Add item</h2></div><button class="icon-btn" value="cancel" aria-label="Close">×</button></div><div id="modal-body"></div><div class="modal-actions"><button class="btn secondary" value="cancel">Cancel</button><button class="btn primary" id="modal-save" value="default">Save changes</button></div></form></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<script src="/app.js" defer></script>
+</body></html>

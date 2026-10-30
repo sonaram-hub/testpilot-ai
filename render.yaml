@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: testpilot-ai
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 10000
+      - key: DATA_DIR
+        value: /data
+      - key: DEPLOYMENT_MODE
+        value: production
+      - key: APP_PASSWORD
+        sync: false
+      - key: AI_API_KEY
+        sync: false
