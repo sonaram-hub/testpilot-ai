@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import base64
+import ast
 import hmac
 import secrets
 import sqlite3
+import socket
 import subprocess
 import sys
 import threading
@@ -135,8 +138,8 @@ def ai_generate(req):
         raise RuntimeError("AI provider is not configured. Set AI_API_KEY in the server environment, then restart TestPilot AI.")
     base = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     model = os.environ.get("AI_MODEL", "gpt-4o-mini")
-    prompt = "Return only a JSON array of test cases with fields title,description,preconditions,steps (array of strings),testData,expectedResult,priority (Low/Medium/High),testType,automationStatus. Include relevant positive, negative, boundary, validation, accessibility, responsive, security and regression coverage. Never claim execution. Requirement:\n" + str(req.get("description", "")) + "\nAcceptance criteria:\n" + str(req.get("acceptanceCriteria", ""))
-    body = json.dumps({"model": model, "temperature": 0.2, "messages": [{"role": "system", "content": "You create practical software QA cases. Output valid JSON only."}, {"role": "user", "content": prompt}]}).encode()
+    prompt = "Create a comprehensive, non-duplicative set of actionable test cases for this single requirement. Return only a JSON array. Each case must have title,description,preconditions,steps (array of concrete strings),testData,expectedResult,priority (Low/Medium/High),testType,automationStatus. Cover applicable positive and negative paths, required and optional fields, invalid input, boundaries explicitly stated by the requirement, validation and error states, keyboard/accessibility, responsive layouts, security and regression. Do not invent business rules, character limits, roles, or expected behavior absent from the requirement. Where a useful detail is unknown, mark it clearly as 'Assumption to confirm' in description or testData. Use safe placeholder test data; never include real passwords, keys, or personal data. Keep each scenario independently executable and state observable expected results. Set automationStatus to 'Not Run'; these are proposed cases and have not been executed. Requirement title: " + str(req.get("title", "")) + "\nRequirement description:\n" + str(req.get("description", "")) + "\nAcceptance criteria:\n" + str(req.get("acceptanceCriteria", ""))
+    body = json.dumps({"model": model, "temperature": 0.2, "messages": [{"role": "system", "content": "You are an experienced software QA engineer. Ground every test in the supplied requirement. Output valid JSON only; do not wrap it in markdown."}, {"role": "user", "content": prompt}]}).encode()
     request = urllib.request.Request(base + "/chat/completions", data=body, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
@@ -148,6 +151,55 @@ def ai_generate(req):
         return cases[:30]
     except (urllib.error.URLError, KeyError, IndexError, json.JSONDecodeError, ValueError) as exc:
         raise RuntimeError("AI generation failed: " + str(exc))
+
+
+
+def ai_generate_script(case, target_url):
+    key = os.environ.get("AI_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("AI provider is not configured; add AI_API_KEY to generate test-specific automation.")
+    target = safe_target(target_url)
+    base = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+    prompt = ("Write one focused, executable Python Playwright pytest test for this QA case. Output Python only, with exactly one function named test_case(page). Start by navigating to this exact URL: " + target.geturl() + "\nUse only the provided page fixture and Playwright locator/assert APIs. No imports, filesystem, shell, eval, external URLs, JavaScript evaluation, or unrelated network requests. Do not use real credentials. Use testData placeholders only. If the expected behavior cannot be safely and reliably automated from the supplied details, make the test assert only the observable navigation/available evidence and leave a clear code comment explaining the limitation. Case title: " + str(case.get("title", "")) + "\nSteps: " + json.dumps(case.get("steps", []), ensure_ascii=False) + "\nExpected result: " + str(case.get("expectedResult", "")) + "\nTest data: " + str(case.get("testData", "")))
+    body = json.dumps({"model": model, "temperature": 0, "messages": [{"role": "system", "content": "Generate conservative Playwright pytest code grounded in the supplied test case. Output code only."}, {"role": "user", "content": prompt}]}).encode()
+    request = urllib.request.Request(base + "/chat/completions", data=body, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            result = json.loads(response.read())
+        code = result["choices"][0]["message"]["content"].strip()
+        if code.startswith("```"):
+            code = "\n".join(line for line in code.splitlines() if not line.strip().startswith("```"))
+        tree = ast.parse(code)
+        functions = [n for n in tree.body if isinstance(n, ast.FunctionDef)]
+        if len(tree.body) != 1 or len(functions) != 1 or functions[0].name != "test_case" or len(functions[0].args.args) != 1 or functions[0].args.args[0].arg != "page":
+            raise ValueError("Generated script must contain only test_case(page)")
+        allowed = {"goto", "title", "url", "get_by_role", "get_by_label", "get_by_placeholder", "get_by_text", "get_by_test_id", "locator", "filter", "nth", "first", "last", "is_visible", "is_enabled", "is_checked", "count", "fill", "click", "check", "uncheck", "select_option", "input_value", "inner_text", "text_content", "wait_for", "press", "screenshot", "get_attribute", "strip", "lower", "startswith", "endswith", "len", "str", "int", "bool"}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal, ast.Lambda, ast.With, ast.AsyncWith)):
+                raise ValueError("Generated script contains a disallowed Python construct")
+            if isinstance(node, ast.Attribute) and (node.attr.startswith("_") or node.attr not in allowed):
+                raise ValueError("Generated script uses a disallowed API: " + node.attr)
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id not in {"len", "str", "int", "bool", "isinstance", "any", "all"}:
+                    raise ValueError("Generated script calls a disallowed Python function")
+                if not isinstance(node.func, (ast.Name, ast.Attribute)):
+                    raise ValueError("Generated script uses a disallowed call target")
+            if isinstance(node, ast.Name) and node.id.startswith("__"):
+                raise ValueError("Generated script contains a disallowed name")
+        compile(tree, "generated_test.py", "exec")
+        navigations = [node for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "goto"]
+        if not navigations:
+            raise ValueError("Generated script must navigate to the project's module URL")
+        for node in navigations:
+            if not node.args or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+                raise ValueError("Generated script must use a fixed module URL")
+            destination = urlparse(node.args[0].value)
+            if destination.hostname != target.hostname or destination.scheme != target.scheme or destination.port != target.port:
+                raise ValueError("Generated script must navigate only to the project's site")
+        return code
+    except (urllib.error.URLError, KeyError, IndexError, SyntaxError, json.JSONDecodeError, ValueError) as exc:
+        raise RuntimeError("Automation generation failed: " + str(exc))
 
 
 def safe_target(raw):
@@ -165,6 +217,12 @@ def safe_target(raw):
     except ValueError as e:
         if "blocked" in str(e):
             raise
+        try:
+            resolved = {ip_address(answer[4][0]) for answer in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)}
+        except OSError as dns_error:
+            raise ValueError("The website host could not be resolved safely.") from dns_error
+        if not resolved or any(not address.is_global for address in resolved):
+            raise ValueError("Private or unresolved website hosts are blocked.")
     return parsed
 
 
@@ -176,11 +234,11 @@ def run_scan(scan_id, conf):
     progress_file = progress_dir / "progress.json"
     stdout_file = progress_dir / "scan-output.json"
     stderr_file = progress_dir / "scan-error.log"
-    worker_conf = {**conf, "_progressFile": str(progress_file)}
+    worker_conf = {**conf, "_progressFile": str(progress_file), "_artifactDir": str(progress_dir)}
     try:
         with stdout_file.open("w", encoding="utf-8") as out, stderr_file.open("w", encoding="utf-8") as err:
             proc = subprocess.Popen([sys.executable, str(ROOT / "scanner_worker.py"), json.dumps(worker_conf)], cwd=ROOT, stdout=out, stderr=err, text=True)
-            deadline = time.time() + 240
+            deadline = time.time() + 540
             while proc.poll() is None and time.time() < deadline:
                 try:
                     progress = json.loads(progress_file.read_text(encoding="utf-8"))
@@ -272,7 +330,17 @@ def pytest_runtest_makereport(item, call):
         if script.get("testCaseId"):
             tc = get_record(script["testCaseId"])
             if tc:
-                save_record("test-cases", {**tc, "automationStatus": "Executed", "lastExecutionStatus": status, "lastRunId": run_id}, tc["id"])
+                outcome = "Pass" if status == "passed" else "Fail" if status == "failed" else "Blocked"
+                updated_case = {**tc, "automationStatus": "Executed", "lastExecutionStatus": status.title(), "qaStatus": outcome, "lastRunId": run_id}
+                if status == "failed":
+                    project = get_record(tc.get("projectId", "")) or {}
+                    priority = {"High": "High", "Medium": "Medium", "Low": "Low"}.get(tc.get("priority"), "Medium")
+                    existing_bug = next((b for b in list_records("bugs", {"projectId": tc.get("projectId")}) if b.get("testCaseId") == tc["id"] and b.get("status") not in ("Closed", "Fixed")), None)
+                    evidence_url = next((artifact["url"] for artifact in reversed(files) if artifact.get("name", "").lower().endswith(".png")), "")
+                    bug_data = {"projectId": tc.get("projectId"), "testCaseId": tc["id"], "environment": run.get("environment", "QA"), "url": project.get("url", ""), "screenshotUrl": evidence_url, "title": "Automation failure · " + tc.get("title", "Test case"), "severity": priority, "status": "Open", "description": reason[:3000], "steps": "\n".join(tc.get("steps", [])) if isinstance(tc.get("steps"), list) else str(tc.get("steps", "")), "expectedResult": tc.get("expectedResult", ""), "actualResult": reason[:3000], "devStatus": "Not started", "bugStatus": "Bug Found", "qaStatus": "Fail", "bugComments": "Auto-created from failed run " + run_id + ". Review this report; automation failures can also be caused by environment issues.", "qaComments": log[-1200:], "findingId": "", "runId": run_id}
+                    bug = save_record("bugs", {**(existing_bug or {}), **bug_data}, existing_bug["id"] if existing_bug else None)
+                    updated_case.update(bugStatus="Bug", bugId=bug["id"], bugComments=bug.get("bugKey", "Bug created") + " · Run " + run_id)
+                save_record("test-cases", updated_case, tc["id"])
     counts = {s: sum(1 for r in results if r["status"] == s) for s in ("passed", "failed", "skipped", "blocked")}
     payload = {**run, "status": "Completed", "finishedAt": now(), "durationSeconds": round(time.time() - started, 2), "results": results, "counts": counts, "artifacts": files}
     save_record("runs", payload, run_id)
@@ -378,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
             if ARTIFACTS.resolve() not in target.parents or not target.is_file():
                 self.send_json({"error": "Artifact not found"}, 404); return
             content = target.read_bytes()
-            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content); return
+            self.send_response(200); self.send_header("Content-Type", mimetypes.guess_type(str(target))[0] or "application/octet-stream"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content); return
         static_files = {"/": ROOT / "index.html", "/index.html": ROOT / "index.html", "/app.js": ROOT / "app.js", "/styles.css": ROOT / "styles.css"}
         file = static_files.get(path)
         if not file or not file.is_file():
@@ -434,6 +502,19 @@ class Handler(BaseHTTPRequestHandler):
                     existing.add(title_key)
                 add_event("AI generated " + str(len(saved)) + " test cases")
                 self.send_json({"cases": saved}); return
+            if path == "/api/ai/script":
+                case = get_record(data.get("testCaseId", ""))
+                if not case or case.get("type") != "test-cases":
+                    self.send_json({"error": "Test case not found"}, 404); return
+                project = get_record(case.get("projectId", ""))
+                if not project or not project.get("url"):
+                    self.send_json({"error": "Add the module URL to its project before generating automation."}, 400); return
+                requirement = get_record(case.get("requirementId", "")) or {}
+                target_url = requirement.get("url") or project.get("url")
+                if not target_url:
+                    self.send_json({"error": "Add a module URL to this requirement or its project before generating automation."}, 400); return
+                code = ai_generate_script(case, target_url)
+                self.send_json({"code": code, "targetUrl": target_url}); return
             if path == "/api/scans/start":
                 if data.get("authorized") is not True:
                     self.send_json({"error": "Confirm that you are authorized to scan this website."}, 400); return
@@ -449,6 +530,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/runs/start":
                 if data.get("authorized") is not True:
                     self.send_json({"error": "Confirm that you are authorized to run the selected tests against this environment."}, 400); return
+                selected_project = get_record(data.get("projectId", ""))
+                selected_cases = {x["id"]: x for x in list_records("test-cases", {"projectId": data.get("projectId")})}
+                selected_scripts = [get_record(x) for x in data.get("scriptIds", [])]
+                if not selected_project or not selected_scripts or any(not x or x.get("projectId") != data.get("projectId") for x in selected_scripts):
+                    self.send_json({"error": "Choose saved scripts that belong to the selected project."}, 400); return
+                requirement_id = data.get("requirementId")
+                if requirement_id and any(x.get("testCaseId") not in selected_cases or selected_cases[x.get("testCaseId")].get("requirementId") != requirement_id for x in selected_scripts):
+                    self.send_json({"error": "The selected scripts do not all belong to this requirement."}, 400); return
                 ident = "RUN-" + secrets.token_hex(4).upper()
                 run = save_record("runs", {"projectId": data.get("projectId"), "environment": data.get("environment", "QA"), "suiteId": data.get("suiteId"), "status": "Queued", "startedAt": now(), "results": [], "counts": {"passed": 0, "failed": 0, "skipped": 0, "blocked": 0}}, ident)
                 threading.Thread(target=run_tests, args=(ident, data), daemon=True).start()

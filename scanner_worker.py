@@ -4,6 +4,8 @@ import os
 import re
 import socket
 import sys
+import urllib.request
+import urllib.error
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -29,6 +31,28 @@ def is_public(url):
         return False
 
 
+def ai_spellcheck(page_texts):
+    key = os.environ.get("AI_API_KEY", "").strip()
+    if not key:
+        return [], "AI provider is not configured"
+    base = os.environ.get("AI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    model = os.environ.get("AI_MODEL", "gpt-4o-mini")
+    text = "\n\n".join(f"PAGE: {url}\n{text[:1100]}" for url, text in page_texts[:20])[:18000]
+    if not text.strip():
+        return [], "No English page text was available"
+    prompt = "Proofread only the visible page text for clear English spelling mistakes. Ignore proper names, product names, URLs, code, and non-English text. Do not report grammar/style preferences. Return only JSON array; each item has url, wrong, suggested, context. Include only high-confidence actual misspellings, maximum 30. Text:\n" + text
+    body = json.dumps({"model": model, "temperature": 0, "messages": [{"role": "system", "content": "You are a conservative spell checker. Output valid JSON only."}, {"role": "user", "content": prompt}]}).encode()
+    request = urllib.request.Request(base + "/chat/completions", data=body, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=35) as response:
+            result = json.loads(response.read())
+        content = result["choices"][0]["message"]["content"]
+        items = json.loads(content[content.find("["):content.rfind("]") + 1])
+        return (items[:30] if isinstance(items, list) else []), f"Completed · first {min(len(page_texts),20)} English pages"
+    except Exception as exc:
+        return [], "Spelling review unavailable: " + str(exc)[:180]
+
+
 def scan(conf):
     from playwright.sync_api import sync_playwright
     start = normalize(conf["url"])
@@ -42,7 +66,7 @@ def scan(conf):
     w, h = {"mobile": (375, 812), "tablet": (768, 1024), "desktop": (1366, 768), "wide": (1920, 1080)}.get(conf.get("viewport"), (1366, 768))
     opts = conf.get("options", {})
     queue, seen = deque([(start, 0)]), set()
-    pages, findings, failed, skipped, blocked = [], [], 0, 0, 0
+    pages, findings, failed, skipped, blocked, page_texts, evidence_by_url = [], [], 0, 0, 0, [], {}
     def publish(current_url="", current_error=""):
         target = conf.get("_progressFile")
         if not target: return
@@ -130,17 +154,31 @@ def scan(conf):
                   const controls=[...document.querySelectorAll('button,input,select,textarea,[role=button]')].map(e=>({tag:e.tagName,type:e.type||'',label:(e.getAttribute('aria-label')||e.labels?.[0]?.innerText||e.innerText||e.placeholder||'').trim(),required:e.required||e.getAttribute('aria-required')==='true',visible:visible(e)}));
                   const forms=[...document.forms].map(f=>({action:f.action,method:f.method,fields:f.elements.length}));
                   const size={scrollWidth:document.documentElement.scrollWidth,clientWidth:document.documentElement.clientWidth,scrollHeight:document.documentElement.scrollHeight};
-                  return {links,imgs,controls,forms,size,metaDescription:!!document.querySelector('meta[name=description]'),headings:[...document.querySelectorAll('h1,h2,h3')].map(e=>({tag:e.tagName,text:e.innerText.trim().slice(0,120)})),text:document.body?.innerText?.slice(0,500)||''};
+                  return {links,imgs,controls,forms,size,metaDescription:!!document.querySelector('meta[name=description]'),headings:[...document.querySelectorAll('h1,h2,h3')].map(e=>({tag:e.tagName,text:e.innerText.trim().slice(0,120)})),text:document.body?.innerText?.slice(0,2200)||'',lang:document.documentElement.lang||''};
                 }""")
                 page_entry = {"url": final_url, "status": status, "title": title, "depth": depth}
                 pages.append(page_entry)
+                if opts.get("spelling", False) and (data.get("lang", "").lower().startswith("en") or not data.get("lang")):
+                    page_texts.append((final_url, data.get("text", "")))
                 def finding(category, severity, title_, detail, element=""):
                     findings.append({"category": category, "severity": severity, "title": title_, "description": detail, "url": final_url, "element": element, "status": "Suspected", "reproductionSteps": ["Open " + final_url, "Inspect the affected page or element"]})
                 if status and status >= 400:
                     finding("Page load", "High" if status >= 500 else "Medium", "Page returned HTTP " + str(status), "The page responded with HTTP " + str(status) + ".")
                 if not title.strip(): finding("Metadata", "Low", "Page title is missing", "The document title is empty.")
                 if not data["metaDescription"]: finding("Metadata", "Low", "Meta description is missing", "No meta description was found.")
-                if data["size"]["scrollWidth"] > data["size"]["clientWidth"] + 2: finding("Responsive", "Medium", "Horizontal overflow detected", "The document is wider than the viewport.", str(data["size"]))
+                if data["size"]["scrollWidth"] > data["size"]["clientWidth"] + 2: finding("Responsive", "Medium", "Horizontal overflow detected", "The document is wider than the viewport at the selected scan size.", str(data["size"]))
+                if opts.get("responsive", True):
+                    original_viewport = {"width": w, "height": h}
+                    for viewport_name, vw, vh in (("mobile", 375, 812), ("tablet", 768, 1024), ("desktop", 1366, 768)):
+                        try:
+                            page.set_viewport_size({"width": vw, "height": vh})
+                            page.wait_for_timeout(100)
+                            dimensions = page.evaluate("({scrollWidth:document.documentElement.scrollWidth,clientWidth:document.documentElement.clientWidth})")
+                            if dimensions["scrollWidth"] > dimensions["clientWidth"] + 2:
+                                finding("Responsive", "Medium", "Horizontal overflow at " + viewport_name, f"The page is wider than the {viewport_name} viewport ({vw} px).", str(dimensions))
+                        except Exception:
+                            pass
+                    page.set_viewport_size(original_viewport)
                 for image in data["imgs"]:
                     if not image["loaded"]: finding("Images", "Medium", "Image did not load", "The browser reports an image with no natural dimensions.", image["src"])
                     if image["alt"] is None: finding("Accessibility", "Low", "Image has no alt attribute", "Automated check: image is missing its alt attribute.", image["src"])
@@ -155,6 +193,20 @@ def scan(conf):
                         href = normalize(link["href"])
                         if href and urlparse(href).hostname == start_domain and href not in seen and depth < max_depth and not re.search(r"logout|signout|sign-out|delete|remove|purchase|checkout|payment|submit", link["href"], re.I):
                             queue.append((href, depth+1))
+                if opts.get("visual", False) and len(evidence_by_url) < 20:
+                    artifact_dir = conf.get("_artifactDir")
+                    if artifact_dir:
+                        try:
+                            os.makedirs(artifact_dir, exist_ok=True)
+                            image_name = f"page-{len(pages):03}.png"
+                            page.screenshot(path=str(Path(artifact_dir) / image_name), full_page=True, timeout=6000)
+                            evidence_url = "/artifacts/" + Path(artifact_dir).name + "/" + image_name
+                            evidence_by_url[final_url] = evidence_url
+                            for item in findings:
+                                if item.get("url") == final_url and not item.get("screenshotUrl"):
+                                    item["screenshotUrl"] = evidence_url
+                        except Exception:
+                            pass
                 if depth >= max_depth:
                     pass
                 publish(final_url)
@@ -167,7 +219,21 @@ def scan(conf):
                 pages.append({"url": url, "status": None, "error": msg, "depth": depth})
                 publish(url, msg)
         browser.close()
-    return {"url": start, "viewport": conf.get("viewport", "desktop"), "finishedAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"), "coverage": {"discovered": len(seen)+len(queue), "scanned": sum(1 for x in pages if not x.get("error")), "failed": failed, "skipped": skipped, "blocked": blocked, "notScannedDueToLimit": len(queue), "depth": max((x.get("depth",0) for x in pages), default=0), "pages": pages}, "findings": findings}
+    spelling_status = "Not requested"
+    if opts.get("spelling", False):
+        spelling_items, spelling_status = ai_spellcheck(page_texts)
+        for item in spelling_items:
+            page_url = item.get("url") or (page_texts[0][0] if page_texts else start)
+            if urlparse(page_url).hostname != start_domain:
+                continue
+            wrong, suggested, context = str(item.get("wrong", ""))[:80], str(item.get("suggested", ""))[:80], str(item.get("context", ""))[:240]
+            if not wrong or not suggested:
+                continue
+            finding = {"category": "Spelling", "severity": "Low", "title": "Possible spelling issue: " + wrong, "description": f"Possible misspelling '{wrong}' → '{suggested}'. Context: {context}", "url": page_url, "element": context, "status": "Needs review", "reproductionSteps": ["Open " + page_url, "Find the text: " + context]}
+            if page_url in evidence_by_url:
+                finding["screenshotUrl"] = evidence_by_url[page_url]
+            findings.append(finding)
+    return {"url": start, "spellingReview": spelling_status, "viewport": conf.get("viewport", "desktop"), "finishedAt": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(timespec="seconds"), "coverage": {"discovered": len(seen)+len(queue), "scanned": sum(1 for x in pages if not x.get("error")), "failed": failed, "skipped": skipped, "blocked": blocked, "notScannedDueToLimit": len(queue), "depth": max((x.get("depth",0) for x in pages), default=0), "pages": pages}, "findings": findings}
 
 
 if __name__ == "__main__":
